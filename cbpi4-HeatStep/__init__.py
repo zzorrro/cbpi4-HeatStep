@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import logging
+import subprocess
 from cbpi.api import *
 from cbpi.api.step import CBPiStep, StepResult
 from cbpi.api.timer import Timer
@@ -11,13 +12,13 @@ logger = logging.getLogger(__name__)
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True),
-    Property.Number(label="Duration", description="Heating duration in minutes (0 = until manual stop)", configurable=True)
+    Property.Number(label="Safety Timeout", description="Auto shutoff after N minutes (0 = disabled)", configurable=True)
 ])
 class HeatStep(CBPiStep):
 
     async def on_timer_done(self, timer):
         self.summary = ""
-        self.cbpi.notify(self.name, 'Heating duration completed. AutoMode left ON.', NotificationType.SUCCESS)
+        self.step_completed_normally = True
         await self.next()
 
     async def on_timer_update(self, timer, seconds):
@@ -26,44 +27,70 @@ class HeatStep(CBPiStep):
 
     async def on_start(self):
         self.port = str(self.cbpi.static_config.get('port', 8000))
+        self.step_completed_normally = False
         
+        # Параметры безопасности
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
+        
+        # Инициализируем таймер на 1 секунду для перехода к следующему шагу
+        if self.timer is None:
+            self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
+        self.timer.start()
+        
+        # Получаем параметры
         self.kettle = self.get_kettle(self.props.Kettle)
         self.target_temp = float(self.props.get("Target Temp", 80))
-        self.duration_minutes = int(self.props.get("Duration", 40))
-        self.duration_seconds = self.duration_minutes * 60
         
         if self.kettle is not None:
+            self.kettle_id = self.kettle.id
             self.kettle.target_temp = self.target_temp
             await self.setAutoMode(True)
-            self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C for {self.duration_minutes} min', NotificationType.SUCCESS)
+            self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
+            self.summary = f"Heating to {self.target_temp}°C..."
             
-            if self.duration_seconds > 0:
-                self.timer = Timer(self.duration_seconds, on_update=self.on_timer_update, on_done=self.on_timer_done)
-                self.timer.start()
-                self.summary = Timer.format_time(self.duration_seconds)
-            else:
-                self.timer = None
-                self.summary = f"Heating to {self.target_temp}°C (manual stop)"
+            # Запускаем защитный таймер через системный планировщик Linux 'at'
+            if self.safety_timeout_minutes > 0:
+                # Скрипт проверяет состояние и выключает только если нагрев включён
+                script = f"""
+curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state": true' && curl -s -X POST http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle
+"""
+                at_command = f"echo '{script}' | at now + {self.safety_timeout_minutes} minutes"
+                
+                try:
+                    result = subprocess.run(
+                        at_command,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    logger.info(f"HeatStep: Safety timer scheduled: {result.stdout.strip()}")
+                    if result.stderr:
+                        logger.warning(f"HeatStep: at stderr: {result.stderr}")
+                except Exception as e:
+                    logger.error(f"HeatStep: Failed to schedule safety timer: {e}")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
-            self.summary = "Error"
+            self.summary = "Error: No kettle selected"
             
         await self.push_update()
 
     async def on_stop(self):
-        if self.timer is not None:
-            await self.timer.stop()
+        await self.timer.stop()
         self.summary = ""
         
-        if self.kettle is not None:
+        # Выключаем AutoMode только при ручной остановке
+        if self.kettle is not None and not self.step_completed_normally:
             await self.setAutoMode(False)
             logger.info("HeatStep: AutoMode forced OFF")
+        elif self.step_completed_normally:
+            logger.info("HeatStep: Step finished normally. AutoMode left ON.")
             
         await self.push_update()
 
     async def reset(self):
-        if self.duration_seconds > 0:
-            self.timer = Timer(self.duration_seconds, on_update=self.on_timer_update, on_done=self.on_timer_done)
+        self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
+        self.step_completed_normally = False
 
     async def run(self):
         while self.running == True:
