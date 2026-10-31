@@ -30,7 +30,7 @@ class HeatStep(CBPiStep):
         self.step_completed_normally = False
         
         # Параметры безопасности
-        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 60))
         
         # Инициализируем таймер на 1 секунду для перехода к следующему шагу
         if self.timer is None:
@@ -48,25 +48,16 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # Запускаем защитный таймер через системный планировщик Linux 'at'
+            # Запускаем защитный таймер через at с python3 однострочником
             if self.safety_timeout_minutes > 0:
-                # Скрипт проверяет состояние и выключает только если нагрев включён
-                script = f"""
-curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state": true' && curl -s -X POST http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle
-"""
-                at_command = f"echo '{script}' | at now + {self.safety_timeout_minutes} minutes"
+                # Python3 однострочник: проверяет состояние и выключает только если включено
+                python_script = f"import urllib.request,json; r=json.loads(urllib.request.urlopen('http://127.0.0.1:{self.port}/kettle/{self.kettle_id}').read()); urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle', method='POST')) if r.get('instance',{{}}).get('state') else None"
+                
+                at_command = f"echo 'python3 -c \"{python_script}\"' | at now + {self.safety_timeout_minutes} minutes"
                 
                 try:
-                    result = subprocess.run(
-                        at_command,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
+                    result = subprocess.run(at_command, shell=True, capture_output=True, text=True, timeout=5)
                     logger.info(f"HeatStep: Safety timer scheduled: {result.stdout.strip()}")
-                    if result.stderr:
-                        logger.warning(f"HeatStep: at stderr: {result.stderr}")
                 except Exception as e:
                     logger.error(f"HeatStep: Failed to schedule safety timer: {e}")
         else:
