@@ -55,6 +55,12 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Error: {str(e)}', NotificationType.ERROR)
             await self.next()
 
+    # ЭТОТ МЕТОД БЫЛ ДОБАВЛЕН, ЧТОБЫ УДОВЛЕТВОРИТЬ ТРЕБОВАНИЯ CBPI4
+    async def run(self):
+        # Так как мы всё делаем в on_start и сразу вызываем self.next(), 
+        # этот метод просто возвращает DONE.
+        return StepResult.DONE
+
     async def on_stop(self):
         """При ручной остановке выключаем нагрев"""
         try:
