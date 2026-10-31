@@ -1,0 +1,4 @@
+name: cbpi4-HeatStep
+version: 1.0.0
+description: Simple step to set kettle target temperature and start heating
+author: zzorrro
