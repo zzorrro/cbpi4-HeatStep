@@ -9,6 +9,9 @@ from cbpi.api.dataclasses import NotificationType
 
 logger = logging.getLogger(__name__)
 
+# Глобальный список для хранения фоновых процессов (чтобы Python их не убил)
+_safety_processes = []
+
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True),
@@ -30,7 +33,7 @@ class HeatStep(CBPiStep):
         self.step_completed_normally = False
         
         # Параметры безопасности
-        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 60))
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
         
         # Инициализируем таймер на 1 секунду для перехода к следующему шагу
         if self.timer is None:
@@ -48,18 +51,17 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # Запускаем защитный таймер через at с python3 однострочником
+            # Запускаем фоновый процесс ОС: ждёт N минут и выключает нагрев
             if self.safety_timeout_minutes > 0:
-                # Python3 однострочник: проверяет состояние и выключает только если включено
-                python_script = f"import urllib.request,json; r=json.loads(urllib.request.urlopen('http://127.0.0.1:{self.port}/kettle/{self.kettle_id}').read()); urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle', method='POST')) if r.get('instance',{{}}).get('state') else None"
+                safety_seconds = self.safety_timeout_minutes * 60
+                # Команда: sleep N секунд, потом curl для выключения
+                command = f"sleep {safety_seconds} && curl -s -X POST http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle"
                 
-                at_command = f"echo 'python3 -c \"{python_script}\"' | at now + {self.safety_timeout_minutes} minutes"
+                # Запускаем как фоновый процесс
+                process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                _safety_processes.append(process)  # Сохраняем ссылку, чтобы Python не убил
                 
-                try:
-                    result = subprocess.run(at_command, shell=True, capture_output=True, text=True, timeout=5)
-                    logger.info(f"HeatStep: Safety timer scheduled: {result.stdout.strip()}")
-                except Exception as e:
-                    logger.error(f"HeatStep: Failed to schedule safety timer: {e}")
+                logger.info(f"HeatStep: Safety process started (PID {process.pid}), will shutdown in {self.safety_timeout_minutes} min")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
             self.summary = "Error: No kettle selected"
