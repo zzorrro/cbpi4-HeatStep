@@ -15,7 +15,7 @@ _safety_processes = []
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True),
-    Property.Number(label="Safety Timeout", description="Auto shutoff after N minutes (0 = disabled)", configurable=True)
+    Property.Number(label="Safety Timeout", description="Auto shutoff after N minutes (default 60, 0 = disabled)", configurable=True)
 ])
 class HeatStep(CBPiStep):
 
