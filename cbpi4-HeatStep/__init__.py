@@ -33,7 +33,7 @@ class HeatStep(CBPiStep):
         self.step_completed_normally = False
         
         # Параметры безопасности
-        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 60))
         
         # Инициализируем таймер на 1 секунду для перехода к следующему шагу
         if self.timer is None:
