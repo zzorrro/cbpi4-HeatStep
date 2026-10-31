@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import logging
+import threading
 from cbpi.api import *
 from cbpi.api.step import CBPiStep, StepResult
 from cbpi.api.timer import Timer
@@ -24,20 +25,20 @@ class HeatStep(CBPiStep):
         self.summary = Timer.format_time(seconds)
         await self.push_update()
 
-    async def safety_timeout(self):
-        """Фоновая задача: выключает нагрев через заданное время через HTTP API"""
+    def _safety_callback(self):
+        """Синхронный callback для threading.Timer — выключает нагрев через HTTP API"""
         try:
-            logger.info(f"HeatStep: Safety timeout task started, waiting {self.safety_timeout_minutes} min")
-            await asyncio.sleep(self.safety_timeout_seconds)
-            logger.info(f"HeatStep: Safety timeout elapsed, attempting to turn OFF kettle {self.kettle_id}")
+            logger.info(f"HeatStep: Safety timeout elapsed, turning OFF kettle {self.kettle_id}")
             
-            # Прямой HTTP-запрос для выключения, без проверки instance
+            # Синхронный HTTP-запрос через urllib (без aiohttp, т.к. мы в другом потоке)
+            import urllib.request
             url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle"
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url) as response:
-                    result = await response.text()
-                    logger.info(f"HeatStep: Safety timeout toggle response: {result}")
+            req = urllib.request.Request(url, method='POST')
+            with urllib.request.urlopen(req, timeout=5) as response:
+                result = response.read().decode()
+                logger.info(f"HeatStep: Safety timeout toggle response: {result}")
             
+            # Уведомление через cbpi (поточно-безопасно)
             self.cbpi.notify(
                 self.name, 
                 f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', 
@@ -45,8 +46,6 @@ class HeatStep(CBPiStep):
             )
             logger.info(f"HeatStep: Safety timeout triggered successfully")
             
-        except asyncio.CancelledError:
-            logger.info("HeatStep: Safety timeout task cancelled")
         except Exception as e:
             logger.error(f"HeatStep: Error in safety timeout: {e}")
             import traceback
@@ -59,9 +58,9 @@ class HeatStep(CBPiStep):
         # Параметры безопасности
         self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
         self.safety_timeout_seconds = self.safety_timeout_minutes * 60
-        self.safety_task = None
+        self.safety_timer = None
         
-        # Инициализируем таймер на 1 секунду
+        # Инициализируем таймер на 1 секунду для перехода к следующему шагу
         if self.timer is None:
             self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
         self.timer.start()
@@ -71,17 +70,22 @@ class HeatStep(CBPiStep):
         self.target_temp = float(self.props.get("Target Temp", 80))
         
         if self.kettle is not None:
-            # Сохраняем ID котла отдельно, чтобы он не потерялся после перехода к следующему шагу
+            # Сохраняем ID котла и порт для фонового потока
             self.kettle_id = self.kettle.id
             self.kettle.target_temp = self.target_temp
             await self.setAutoMode(True)
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # Запускаем защитный таймаут, если он задан (>0)
+            # Запускаем защитный таймер через threading (не зависит от жизненного цикла шага)
             if self.safety_timeout_seconds > 0:
-                self.safety_task = asyncio.create_task(self.safety_timeout())
-                logger.info(f"HeatStep: Safety timeout set for {self.safety_timeout_minutes} min")
+                self.safety_timer = threading.Timer(
+                    self.safety_timeout_seconds, 
+                    self._safety_callback
+                )
+                self.safety_timer.daemon = True  # Поток завершится вместе с программой
+                self.safety_timer.start()
+                logger.info(f"HeatStep: Safety timer started for {self.safety_timeout_minutes} min (threading)")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
             self.summary = "Error: No kettle selected"
@@ -92,10 +96,11 @@ class HeatStep(CBPiStep):
         await self.timer.stop()
         self.summary = ""
         
-        # Отменяем задачу защитного таймаута
-        if self.safety_task is not None:
-            self.safety_task.cancel()
-            self.safety_task = None
+        # Отменяем threading.Timer при ручной остановке
+        if self.safety_timer is not None:
+            self.safety_timer.cancel()
+            self.safety_timer = None
+            logger.info("HeatStep: Safety timer cancelled due to manual stop")
         
         # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
@@ -109,9 +114,9 @@ class HeatStep(CBPiStep):
     async def reset(self):
         self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
         self.step_completed_normally = False
-        if self.safety_task is not None:
-            self.safety_task.cancel()
-            self.safety_task = None
+        if self.safety_timer is not None:
+            self.safety_timer.cancel()
+            self.safety_timer = None
 
     async def run(self):
         while self.running == True:
