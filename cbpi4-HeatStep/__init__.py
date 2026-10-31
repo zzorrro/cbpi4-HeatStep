@@ -25,19 +25,32 @@ class HeatStep(CBPiStep):
         await self.push_update()
 
     async def safety_timeout(self):
-        """Фоновая задача: выключает нагрев через заданное время"""
+        """Фоновая задача: выключает нагрев через заданное время через HTTP API"""
         try:
+            logger.info(f"HeatStep: Safety timeout task started, waiting {self.safety_timeout_minutes} min")
             await asyncio.sleep(self.safety_timeout_seconds)
-            if (self.kettle is not None and 
-                self.kettle.instance is not None and 
-                self.kettle.instance.state == True):
-                await self.setAutoMode(False)
-                self.cbpi.notify(self.name, f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', NotificationType.WARNING)
-                logger.info(f"HeatStep: Safety timeout triggered after {self.safety_timeout_minutes} min")
+            logger.info(f"HeatStep: Safety timeout elapsed, attempting to turn OFF kettle {self.kettle_id}")
+            
+            # Прямой HTTP-запрос для выключения, без проверки instance
+            url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle"
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url) as response:
+                    result = await response.text()
+                    logger.info(f"HeatStep: Safety timeout toggle response: {result}")
+            
+            self.cbpi.notify(
+                self.name, 
+                f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', 
+                NotificationType.WARNING
+            )
+            logger.info(f"HeatStep: Safety timeout triggered successfully")
+            
         except asyncio.CancelledError:
             logger.info("HeatStep: Safety timeout task cancelled")
         except Exception as e:
             logger.error(f"HeatStep: Error in safety timeout: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     async def on_start(self):
         self.port = str(self.cbpi.static_config.get('port', 8000))
@@ -58,6 +71,8 @@ class HeatStep(CBPiStep):
         self.target_temp = float(self.props.get("Target Temp", 80))
         
         if self.kettle is not None:
+            # Сохраняем ID котла отдельно, чтобы он не потерялся после перехода к следующему шагу
+            self.kettle_id = self.kettle.id
             self.kettle.target_temp = self.target_temp
             await self.setAutoMode(True)
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
