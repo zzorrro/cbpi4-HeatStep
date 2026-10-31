@@ -2,6 +2,7 @@ import asyncio
 import aiohttp
 import logging
 import threading
+import subprocess
 from cbpi.api import *
 from cbpi.api.step import CBPiStep, StepResult
 from cbpi.api.timer import Timer
@@ -26,28 +27,33 @@ class HeatStep(CBPiStep):
         await self.push_update()
 
     def _safety_callback(self):
-        """Синхронный callback для threading.Timer — выключает нагрев через HTTP API"""
+        """Синхронный callback для threading.Timer — выключает нагрев через curl"""
         try:
-            logger.info(f"HeatStep: Safety timeout elapsed, turning OFF kettle {self.kettle_id}")
+            logger.info(f"HeatStep: === SAFETY CALLBACK CALLED ===")
+            logger.info(f"HeatStep: kettle_id={self.kettle_id}, port={self.port}")
             
-            # Синхронный HTTP-запрос через urllib (без aiohttp, т.к. мы в другом потоке)
-            import urllib.request
             url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle"
-            req = urllib.request.Request(url, method='POST')
-            with urllib.request.urlopen(req, timeout=5) as response:
-                result = response.read().decode()
-                logger.info(f"HeatStep: Safety timeout toggle response: {result}")
+            logger.info(f"HeatStep: Calling curl: POST {url}")
             
-            # Уведомление через cbpi (поточно-безопасно)
-            self.cbpi.notify(
-                self.name, 
-                f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', 
-                NotificationType.WARNING
+            # Используем curl через subprocess — работает из любого потока
+            result = subprocess.run(
+                ['curl', '-s', '-X', 'POST', url],
+                capture_output=True,
+                text=True,
+                timeout=10
             )
-            logger.info(f"HeatStep: Safety timeout triggered successfully")
             
+            logger.info(f"HeatStep: curl exit code: {result.returncode}")
+            logger.info(f"HeatStep: curl stdout: {result.stdout}")
+            logger.info(f"HeatStep: curl stderr: {result.stderr}")
+            
+            if result.returncode == 0:
+                logger.info(f"HeatStep: Safety timeout triggered successfully!")
+            else:
+                logger.error(f"HeatStep: curl failed with code {result.returncode}")
+                
         except Exception as e:
-            logger.error(f"HeatStep: Error in safety timeout: {e}")
+            logger.error(f"HeatStep: Error in safety callback: {e}")
             import traceback
             logger.error(traceback.format_exc())
 
@@ -77,15 +83,15 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # Запускаем защитный таймер через threading (не зависит от жизненного цикла шага)
+            # Запускаем защитный таймер через threading
             if self.safety_timeout_seconds > 0:
                 self.safety_timer = threading.Timer(
                     self.safety_timeout_seconds, 
                     self._safety_callback
                 )
-                self.safety_timer.daemon = True  # Поток завершится вместе с программой
+                self.safety_timer.daemon = True
                 self.safety_timer.start()
-                logger.info(f"HeatStep: Safety timer started for {self.safety_timeout_minutes} min (threading)")
+                logger.info(f"HeatStep: Safety timer started for {self.safety_timeout_minutes} min")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
             self.summary = "Error: No kettle selected"
@@ -100,12 +106,12 @@ class HeatStep(CBPiStep):
         if self.safety_timer is not None:
             self.safety_timer.cancel()
             self.safety_timer = None
-            logger.info("HeatStep: Safety timer cancelled due to manual stop")
+            logger.info("HeatStep: Safety timer cancelled")
         
         # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
             await self.setAutoMode(False)
-            logger.info("HeatStep: AutoMode forced OFF due to manual stop")
+            logger.info("HeatStep: AutoMode forced OFF")
         elif self.step_completed_normally:
             logger.info("HeatStep: Step finished normally. AutoMode left ON.")
             
@@ -128,14 +134,12 @@ class HeatStep(CBPiStep):
             if self.kettle is None:
                 return
             
-            # ВКЛЮЧЕНИЕ
             if (self.kettle.instance is None or self.kettle.instance.state == False) and (auto_state is True):
                 url = "http://127.0.0.1:" + self.port + "/kettle/" + self.kettle.id + "/toggle"
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url) as response:
                         return await response.text()
             
-            # ВЫКЛЮЧЕНИЕ
             elif self.kettle.instance is not None and self.kettle.instance.state == True and (auto_state is False):
                 await self.kettle.instance.stop()
                 await self.push_update()
