@@ -25,20 +25,14 @@ class HeatStep(CBPiStep):
         await self.push_update()
 
     async def safety_timeout(self):
-        """Фоновая задача: выключает нагрев через заданное время для безопасности"""
+        """Фоновая задача: выключает нагрев через заданное время"""
         try:
             await asyncio.sleep(self.safety_timeout_seconds)
-            
             if (self.kettle is not None and 
                 self.kettle.instance is not None and 
                 self.kettle.instance.state == True):
-                
                 await self.setAutoMode(False)
-                self.cbpi.notify(
-                    self.name, 
-                    f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', 
-                    NotificationType.WARNING
-                )
+                self.cbpi.notify(self.name, f'Safety timeout: heating stopped after {self.safety_timeout_minutes} min', NotificationType.WARNING)
                 logger.info(f"HeatStep: Safety timeout triggered after {self.safety_timeout_minutes} min")
         except asyncio.CancelledError:
             logger.info("HeatStep: Safety timeout task cancelled")
@@ -50,16 +44,16 @@ class HeatStep(CBPiStep):
         self.step_completed_normally = False
         
         # Параметры безопасности
-        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 60))
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 40))
         self.safety_timeout_seconds = self.safety_timeout_minutes * 60
         self.safety_task = None
         
-        # 1. Инициализируем таймер на 1 секунду для автоматического перехода
+        # Инициализируем таймер на 1 секунду
         if self.timer is None:
             self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
         self.timer.start()
         
-        # 2. Получаем параметры
+        # Получаем параметры
         self.kettle = self.get_kettle(self.props.Kettle)
         self.target_temp = float(self.props.get("Target Temp", 80))
         
@@ -69,7 +63,7 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # 3. Запускаем защитный таймаут, если он задан (>0)
+            # Запускаем защитный таймаут, если он задан (>0)
             if self.safety_timeout_seconds > 0:
                 self.safety_task = asyncio.create_task(self.safety_timeout())
                 logger.info(f"HeatStep: Safety timeout set for {self.safety_timeout_minutes} min")
@@ -80,9 +74,6 @@ class HeatStep(CBPiStep):
         await self.push_update()
 
     async def on_stop(self):
-        """Вызывается при остановке шага (включая остановку всего рецепта)"""
-        logger.info(f"HeatStep: on_stop called. step_completed_normally={self.step_completed_normally}, kettle={self.kettle}")
-        
         await self.timer.stop()
         self.summary = ""
         
@@ -91,11 +82,10 @@ class HeatStep(CBPiStep):
             self.safety_task.cancel()
             self.safety_task = None
         
-        # Выключаем AutoMode только при ручной остановке (STOP рецепта или шага)
+        # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
-            logger.info(f"HeatStep: Forcing AutoMode OFF for kettle {self.kettle.id}")
             await self.setAutoMode(False)
-            self.cbpi.notify(self.name, 'Heating stopped (manual stop)', NotificationType.WARNING)
+            logger.info("HeatStep: AutoMode forced OFF due to manual stop")
         elif self.step_completed_normally:
             logger.info("HeatStep: Step finished normally. AutoMode left ON.")
             
@@ -114,47 +104,24 @@ class HeatStep(CBPiStep):
         return StepResult.DONE
 
     async def setAutoMode(self, auto_state):
-        """Управление AutoMode через HTTP API (надежнее, чем через instance)"""
         try:
             if self.kettle is None:
-                logger.warning("HeatStep: No kettle selected, cannot toggle AutoMode")
                 return
             
-            kettle_id = self.kettle.id
-            url = f"http://127.0.0.1:{self.port}/kettle/{kettle_id}/toggle"
-            
-            # Проверяем текущее состояние через API
-            current_state = False
-            if self.kettle.instance is not None:
-                current_state = self.kettle.instance.state
-                logger.info(f"HeatStep: Current kettle state via instance: {current_state}")
-            
-            # ВКЛЮЧЕНИЕ: если котел выключен или instance недоступен
-            if (self.kettle.instance is None or current_state == False) and auto_state == True:
-                logger.info(f"HeatStep: Turning ON AutoMode via HTTP: {url}")
+            # ВКЛЮЧЕНИЕ
+            if (self.kettle.instance is None or self.kettle.instance.state == False) and (auto_state is True):
+                url = "http://127.0.0.1:" + self.port + "/kettle/" + self.kettle.id + "/toggle"
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url) as response:
-                        result = await response.text()
-                        logger.info(f"HeatStep: Toggle ON response: {result}")
-                        return result
+                        return await response.text()
             
-            # ВЫКЛЮЧЕНИЕ: используем HTTP API вместо instance.stop()
-            elif auto_state == False:
-                # Проверяем, включен ли котел
-                if self.kettle.instance is not None and current_state == True:
-                    logger.info(f"HeatStep: Turning OFF AutoMode via HTTP: {url}")
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url) as response:
-                            result = await response.text()
-                            logger.info(f"HeatStep: Toggle OFF response: {result}")
-                            return result
-                else:
-                    logger.info(f"HeatStep: Kettle already OFF or instance unavailable, skipping toggle")
+            # ВЫКЛЮЧЕНИЕ
+            elif self.kettle.instance is not None and self.kettle.instance.state == True and (auto_state is False):
+                await self.kettle.instance.stop()
+                await self.push_update()
                 
         except Exception as e:
-            logger.error(f"HeatStep: Failed to switch KettleLogic {self.kettle.id}: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logging.error(f"Failed to switch KettleLogic {self.kettle.id}: {e}")
 
 
 def setup(cbpi):
