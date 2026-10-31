@@ -16,42 +16,53 @@ class HeatStep(CBPiStep):
     async def on_start(self):
         self.port = str(self.cbpi.static_config.get('port', 8000))
         
-        # Получаем выбранный котёл
-        self.kettle = self.get_kettle(self.props.Kettle)
-        self.target_temp = float(self.props.get("Target Temp", 80))
-        
-        if self.kettle is None:
-            self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
-            logger.error("HeatStep: No kettle selected")
+        try:
+            # Получаем выбранный котёл
+            self.kettle = self.get_kettle(self.props.Kettle)
+            self.target_temp = float(self.props.get("Target Temp", 80))
+            
+            if self.kettle is None:
+                self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
+                logger.error("HeatStep: No kettle selected")
+                await self.next()
+                return
+            
+            # 1. Задаём уставку котлу
+            self.kettle.target_temp = self.target_temp
+            logger.info(f"HeatStep: Set target temp {self.target_temp}°C for kettle ID {self.kettle.id}")
+            
+            # 2. Включаем AutoMode (нагрев)
+            await self.setAutoMode(True)
+            logger.info(f"HeatStep: AutoMode ON for kettle ID {self.kettle.id}")
+            
+            self.cbpi.notify(
+                self.name, 
+                f'Heating to {self.target_temp}°C', 
+                NotificationType.SUCCESS
+            )
+            
+            self.summary = f"Heating to {self.target_temp}°C..."
+            await self.push_update()
+            
+            # 3. Шаг завершается СРАЗУ, нагрев продолжает работать
+            await asyncio.sleep(1)
             await self.next()
-            return
-        
-        # 1. Задаём уставку котлу
-        self.kettle.target_temp = self.target_temp
-        logger.info(f"HeatStep: Set target temp {self.target_temp}°C for kettle {self.kettle.id}")
-        
-        # 2. Включаем AutoMode (нагрев)
-        await self.setAutoMode(True)
-        logger.info(f"HeatStep: AutoMode ON for kettle {self.kettle.id}")
-        
-        self.cbpi.notify(
-            self.name, 
-            f'Heating {self.kettle.name} to {self.target_temp}°C', 
-            NotificationType.SUCCESS
-        )
-        
-        self.summary = f"Heating to {self.target_temp}°C..."
-        await self.push_update()
-        
-        # 3. Шаг завершается СРАЗУ, нагрев продолжает работать
-        await asyncio.sleep(1)
-        await self.next()
+            
+        except Exception as e:
+            logger.error(f"HeatStep: Error in on_start: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.cbpi.notify(self.name, f'Error: {str(e)}', NotificationType.ERROR)
+            await self.next()
 
     async def on_stop(self):
         """При ручной остановке выключаем нагрев"""
-        if self.kettle is not None:
-            await self.setAutoMode(False)
-            logger.info("HeatStep: AutoMode forced OFF")
+        try:
+            if self.kettle is not None:
+                await self.setAutoMode(False)
+                logger.info("HeatStep: AutoMode forced OFF")
+        except Exception as e:
+            logger.error(f"HeatStep: Error in on_stop: {e}")
         self.summary = ""
         await self.push_update()
 
