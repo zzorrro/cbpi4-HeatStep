@@ -3,6 +3,7 @@ import aiohttp
 import logging
 from cbpi.api import *
 from cbpi.api.step import CBPiStep, StepResult
+from cbpi.api.timer import Timer
 from cbpi.api.dataclasses import NotificationType
 
 logger = logging.getLogger(__name__)
@@ -12,68 +13,66 @@ logger = logging.getLogger(__name__)
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True)
 ])
 class HeatStep(CBPiStep):
-    
-    async def on_start(self):
-        self.port = str(self.cbpi.static_config.get('port', 8000))
-        
-        try:
-            # Получаем выбранный котёл
-            self.kettle = self.get_kettle(self.props.Kettle)
-            self.target_temp = float(self.props.get("Target Temp", 80))
-            
-            if self.kettle is None:
-                self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
-                logger.error("HeatStep: No kettle selected")
-                await self.next()
-                return
-            
-            # 1. Задаём уставку котлу
-            self.kettle.target_temp = self.target_temp
-            logger.info(f"HeatStep: Set target temp {self.target_temp}°C for kettle ID {self.kettle.id}")
-            
-            # 2. Включаем AutoMode (нагрев)
-            await self.setAutoMode(True)
-            logger.info(f"HeatStep: AutoMode ON for kettle ID {self.kettle.id}")
-            
-            self.cbpi.notify(
-                self.name, 
-                f'Heating to {self.target_temp}°C', 
-                NotificationType.SUCCESS
-            )
-            
-            self.summary = f"Heating to {self.target_temp}°C..."
-            await self.push_update()
-            
-            # 3. Шаг завершается СРАЗУ, нагрев продолжает работать
-            await asyncio.sleep(1)
-            await self.next()
-            
-        except Exception as e:
-            logger.error(f"HeatStep: Error in on_start: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.cbpi.notify(self.name, f'Error: {str(e)}', NotificationType.ERROR)
-            await self.next()
 
-    # ЭТОТ МЕТОД БЫЛ ДОБАВЛЕН, ЧТОБЫ УДОВЛЕТВОРИТЬ ТРЕБОВАНИЯ CBPI4
-    async def run(self):
-        # Так как мы всё делаем в on_start и сразу вызываем self.next(), 
-        # этот метод просто возвращает DONE.
-        return StepResult.DONE
-
-    async def on_stop(self):
-        """При ручной остановке выключаем нагрев"""
-        try:
-            if self.kettle is not None:
-                await self.setAutoMode(False)
-                logger.info("HeatStep: AutoMode forced OFF")
-        except Exception as e:
-            logger.error(f"HeatStep: Error in on_stop: {e}")
+    async def on_timer_done(self, timer):
         self.summary = ""
+        # КРИТИЧЕСКИ ВАЖНО: Ставим флаг, что шаг завершился нормально.
+        # Это спасет AutoMode от выключения в on_stop.
+        self.step_completed_normally = True 
+        await self.next()
+
+    async def on_timer_update(self, timer, seconds):
+        self.summary = Timer.format_time(seconds)
         await self.push_update()
 
+    async def on_start(self):
+        self.port = str(self.cbpi.static_config.get('port', 8000))
+        self.step_completed_normally = False  # Инициализируем флаг
+        
+        # 1. Инициализируем таймер на 1 секунду для автоматического перехода
+        if self.timer is None:
+            self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
+        self.timer.start()
+        
+        # 2. Получаем параметры
+        self.kettle = self.get_kettle(self.props.Kettle)
+        self.target_temp = float(self.props.get("Target Temp", 80))
+        
+        if self.kettle is not None:
+            self.kettle.target_temp = self.target_temp
+            await self.setAutoMode(True)
+            self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
+            self.summary = f"Heating to {self.target_temp}°C..."
+        else:
+            self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
+            self.summary = "Error: No kettle selected"
+            
+        await self.push_update()
+
+    async def on_stop(self):
+        await self.timer.stop()
+        self.summary = ""
+        
+        # ВЫКЛЮЧАЕМ АВТОРЕЖИМ ТОЛЬКО ЕСЛИ ЭТО РУЧНАЯ ОСТАНОВКА (КНОПКА STOP)
+        # Если шаг завершился нормально (перешел к следующему), AutoMode остается включенным!
+        if self.kettle is not None and not self.step_completed_normally:
+            await self.setAutoMode(False)
+            logger.info("HeatStep: AutoMode forced OFF due to manual stop")
+        elif self.step_completed_normally:
+            logger.info("HeatStep: Step finished normally. AutoMode left ON.")
+            
+        await self.push_update()
+
+    async def reset(self):
+        self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
+        self.step_completed_normally = False
+
+    async def run(self):
+        while self.running == True:
+            await asyncio.sleep(1)
+        return StepResult.DONE
+
     async def setAutoMode(self, auto_state):
-        """Управление AutoMode ТОЛЬКО для выбранного котла"""
         try:
             if self.kettle is None:
                 return
