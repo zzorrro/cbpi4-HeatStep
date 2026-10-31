@@ -50,11 +50,11 @@ class HeatStep(CBPiStep):
             
             # Запускаем защитный таймер через системный планировщик Linux 'at'
             if self.safety_timeout_minutes > 0:
-                url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle"
-                command = f"curl -s -X POST {url}"
-                
-                # Используем 'at' для выполнения команды через N минут
-                at_command = f"echo '{command}' | at now + {self.safety_timeout_minutes} minutes"
+                # Скрипт проверяет состояние и выключает только если нагрев включён
+                script = f"""
+curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state": true' && curl -s -X POST http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle
+"""
+                at_command = f"echo '{script}' | at now + {self.safety_timeout_minutes} minutes"
                 
                 try:
                     result = subprocess.run(
@@ -64,7 +64,7 @@ class HeatStep(CBPiStep):
                         text=True,
                         timeout=5
                     )
-                    logger.info(f"HeatStep: Safety timer scheduled via 'at': {result.stdout}")
+                    logger.info(f"HeatStep: Safety timer scheduled: {result.stdout.strip()}")
                     if result.stderr:
                         logger.warning(f"HeatStep: at stderr: {result.stderr}")
                 except Exception as e:
