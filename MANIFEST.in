@@ -1,0 +1,6 @@
+include README.md
+include LICENSE
+include cbpi4_ActorTempStep/config.yaml
+include cbpi4_ActorTempStep/*.yaml
+include cbpi4_ActorTempStep/*.txt
+include cbpi4_ActorTempStep/*.rst
