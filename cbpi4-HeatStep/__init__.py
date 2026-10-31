@@ -1,13 +1,18 @@
 import asyncio
 import aiohttp
 import logging
-import subprocess
+import threading
+import urllib.request
+import json
 from cbpi.api import *
 from cbpi.api.step import CBPiStep, StepResult
 from cbpi.api.timer import Timer
 from cbpi.api.dataclasses import NotificationType
 
 logger = logging.getLogger(__name__)
+
+# Глобальный словарь для хранения активных таймеров безопасности
+_safety_timers = {}
 
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
@@ -24,6 +29,28 @@ class HeatStep(CBPiStep):
     async def on_timer_update(self, timer, seconds):
         self.summary = Timer.format_time(seconds)
         await self.push_update()
+
+    def _safety_callback(self, kettle_id, port, timeout_minutes):
+        """Callback для threading.Timer - выключает нагрев через заданное время"""
+        try:
+            # Проверяем состояние котла
+            url = f"http://127.0.0.1:{port}/kettle/{kettle_id}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode())
+                state = data.get('instance', {}).get('state', False)
+            
+            if state:
+                # Выключаем нагрев
+                url = f"http://127.0.0.1:{port}/kettle/{kettle_id}/toggle"
+                req = urllib.request.Request(url, method='POST')
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    logger.info(f"HeatStep: Safety timeout triggered, kettle {kettle_id} turned OFF")
+        except Exception as e:
+            logger.error(f"HeatStep: Error in safety callback: {e}")
+        finally:
+            # Удаляем таймер из глобального словаря
+            _safety_timers.pop(kettle_id, None)
 
     async def on_start(self):
         self.port = str(self.cbpi.static_config.get('port', 8000))
@@ -48,27 +75,25 @@ class HeatStep(CBPiStep):
             self.cbpi.notify(self.name, f'Heating to {self.target_temp}°C', NotificationType.SUCCESS)
             self.summary = f"Heating to {self.target_temp}°C..."
             
-            # Запускаем защитный таймер через системный планировщик Linux 'at'
+            # Запускаем защитный таймер через threading.Timer
             if self.safety_timeout_minutes > 0:
-                # Скрипт проверяет состояние и выключает только если нагрев включён
-                script = f"""
-curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state": true' && curl -s -X POST http://127.0.0.1:{self.port}/kettle/{self.kettle_id}/toggle
-"""
-                at_command = f"echo '{script}' | at now + {self.safety_timeout_minutes} minutes"
+                # Отменяем старый таймер для этого котла, если есть
+                if self.kettle_id in _safety_timers:
+                    _safety_timers[self.kettle_id].cancel()
                 
-                try:
-                    result = subprocess.run(
-                        at_command,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    logger.info(f"HeatStep: Safety timer scheduled: {result.stdout.strip()}")
-                    if result.stderr:
-                        logger.warning(f"HeatStep: at stderr: {result.stderr}")
-                except Exception as e:
-                    logger.error(f"HeatStep: Failed to schedule safety timer: {e}")
+                # Создаём новый таймер
+                timer = threading.Timer(
+                    self.safety_timeout_minutes * 60,
+                    self._safety_callback,
+                    args=[self.kettle_id, self.port, self.safety_timeout_minutes]
+                )
+                timer.daemon = True
+                timer.start()
+                
+                # Сохраняем в глобальный словарь
+                _safety_timers[self.kettle_id] = timer
+                
+                logger.info(f"HeatStep: Safety timer started for {self.safety_timeout_minutes} min")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
             self.summary = "Error: No kettle selected"
@@ -78,6 +103,12 @@ curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state":
     async def on_stop(self):
         await self.timer.stop()
         self.summary = ""
+        
+        # Отменяем таймер безопасности при ручной остановке
+        if hasattr(self, 'kettle_id') and self.kettle_id in _safety_timers:
+            _safety_timers[self.kettle_id].cancel()
+            del _safety_timers[self.kettle_id]
+            logger.info("HeatStep: Safety timer cancelled due to manual stop")
         
         # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
@@ -91,6 +122,11 @@ curl -s http://127.0.0.1:{self.port}/kettle/{self.kettle_id} | grep -q '"state":
     async def reset(self):
         self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
         self.step_completed_normally = False
+        
+        # Отменяем таймер безопасности при сбросе
+        if hasattr(self, 'kettle_id') and self.kettle_id in _safety_timers:
+            _safety_timers[self.kettle_id].cancel()
+            del _safety_timers[self.kettle_id]
 
     async def run(self):
         while self.running == True:
