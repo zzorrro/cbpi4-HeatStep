@@ -27,7 +27,7 @@ class HeatStep(CBPiStep):
 
     async def on_timer_done(self, timer):
         self.summary = ""
-        self.step_completed_normally = True  # <-- КЛЮЧЕВОЙ ФЛАГ
+        self.step_completed_normally = True
         await self.next()
 
     async def on_timer_update(self, timer, seconds):
@@ -72,27 +72,33 @@ class HeatStep(CBPiStep):
         await self.push_update()
 
     async def _safety_shutdown(self, seconds: int):
+        """Усиленная задача безопасности с двойной защитой"""
         try:
             await asyncio.sleep(seconds)
             
+            # Уровень 0: Получаем актуальный объект котла
             kettle = self.get_kettle(self.kettle_id)
             if not kettle:
                 logger.error(f"SAFETY TIMER: Kettle {self.kettle_id} NOT FOUND!")
                 return
 
-            # Уровень 1: Остановка логики
+            # Уровень 1: Останавливаем логику котла
             if kettle.instance and kettle.instance.state:
                 await kettle.instance.stop()
                 logger.warning(f"SAFETY TIMER: Kettle logic stopped for {self.kettle_id}")
 
-            # Уровень 2: Прямое выключение актора (двойная защита)
+            # Уровень 2: Прямое выключение актора нагревателя (ДВОЙНАЯ ЗАЩИТА)
             if kettle.heater:
-                heater_actor = self.cbpi.actor.get(kettle.heater)
+                # ИСПРАВЛЕНО: используем find_by_id, как в стандартном API CBPi4
+                heater_actor = self.cbpi.actor.find_by_id(kettle.heater)
                 if heater_actor:
                     await heater_actor.off()
                     logger.warning(f"SAFETY TIMER: Heater actor '{kettle.heater}' forced OFF directly")
+                else:
+                    logger.error(f"SAFETY TIMER: Could not find heater actor '{kettle.heater}'")
 
             self.cbpi.notify('SAFETY SYSTEM', f'TIMEOUT REACHED: Kettle {self.kettle_id} FORCED STOP!', NotificationType.WARNING)
+            logger.warning(f"SAFETY TIMER: Execution complete. Kettle {self.kettle_id} should be OFF.")
                 
         except asyncio.CancelledError:
             logger.info(f"SAFETY TIMER: Task for kettle {self.kettle_id} was cancelled")
@@ -103,7 +109,7 @@ class HeatStep(CBPiStep):
         await self.timer.stop()
         self.summary = ""
         
-        # ИСПРАВЛЕНИЕ: Отменяем safety-задачу ТОЛЬКО при ручной остановке!
+        # Отменяем safety-задачу ТОЛЬКО при ручной остановке
         if self.kettle_id and not self.step_completed_normally and self.kettle_id in _safety_tasks:
             _safety_tasks[self.kettle_id].cancel()
             logger.info("HeatStep: Safety task cancelled due to MANUAL stop")
