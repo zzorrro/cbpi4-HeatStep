@@ -11,6 +11,21 @@ logger = logging.getLogger(__name__)
 # Глобальный словарь для хранения задач безопасности
 _safety_tasks = {}
 
+
+def _make_cleanup(kettle_id, task):
+    """
+    Фабрика callback'ов для безопасной очистки словаря.
+    Проверяет, что в словаре всё ещё лежит именно эта задача,
+    прежде чем удалять запись. Это предотвращает гонку состояний
+    при повторном запуске HeatStep на том же котле.
+    """
+    def cleanup(_):
+        if _safety_tasks.get(kettle_id) is task:
+            _safety_tasks.pop(kettle_id, None)
+            logger.info(f"HeatStep: Safety task for kettle {kettle_id} removed from registry")
+    return cleanup
+
+
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True),
@@ -57,12 +72,15 @@ class HeatStep(CBPiStep):
                 old_task = _safety_tasks.get(self.kettle_id)
                 if old_task:
                     old_task.cancel()
+                    logger.info(f"HeatStep: Cancelled previous safety task for kettle {self.kettle_id}")
 
                 # Создаем новую задачу
                 task = asyncio.create_task(self._safety_shutdown(self.safety_timeout_minutes * 60))
                 
-                # Добавляем callback для автоматической очистки словаря после завершения/отмены задачи
-                task.add_done_callback(lambda t: _safety_tasks.pop(self.kettle_id, None))
+                # Добавляем БЕЗОПАСНЫЙ callback, который проверяет идентичность задачи перед удалением
+                task.add_done_callback(_make_cleanup(self.kettle_id, task))
+                
+                # Сохраняем ссылку, чтобы избежать GC
                 _safety_tasks[self.kettle_id] = task
                 
                 logger.info(f"HeatStep: Native safety task started, will shutdown in {self.safety_timeout_minutes} min")
@@ -99,7 +117,7 @@ class HeatStep(CBPiStep):
         # Отменяем задачу безопасности при ручной остановке шага
         if self.kettle_id and self.kettle_id in _safety_tasks:
             _safety_tasks[self.kettle_id].cancel()
-            # Callback сам удалит запись из словаря
+            # Callback сам удалит запись из словаря, если это та же задача
             
         # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
