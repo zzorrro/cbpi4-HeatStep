@@ -87,15 +87,11 @@ class HeatStep(CBPiStep):
                 await kettle.instance.stop()
                 logger.warning(f"SAFETY TIMER: Kettle logic stopped for {self.kettle_id}")
 
-            # Уровень 2: Прямое выключение актора нагревателя (ДВОЙНАЯ ЗАЩИТА)
+            # Уровень 2: Прямое выключение актора (ДВОЙНАЯ ЗАЩИТА)
             if kettle.heater:
-                # ИСПРАВЛЕНО: используем find_by_id, как в стандартном API CBPi4
-                heater_actor = self.cbpi.actor.find_by_id(kettle.heater)
-                if heater_actor:
-                    await heater_actor.off()
-                    logger.warning(f"SAFETY TIMER: Heater actor '{kettle.heater}' forced OFF directly")
-                else:
-                    logger.error(f"SAFETY TIMER: Could not find heater actor '{kettle.heater}'")
+                # Используем встроенный метод шага - это правильно и надежно!
+                await self.actor_off(kettle.heater)
+                logger.warning(f"SAFETY TIMER: Heater actor '{kettle.heater}' forced OFF directly")
 
             self.cbpi.notify('SAFETY SYSTEM', f'TIMEOUT REACHED: Kettle {self.kettle_id} FORCED STOP!', NotificationType.WARNING)
             logger.warning(f"SAFETY TIMER: Execution complete. Kettle {self.kettle_id} should be OFF.")
