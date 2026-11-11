@@ -8,8 +8,7 @@ from cbpi.api.dataclasses import NotificationType
 
 logger = logging.getLogger(__name__)
 
-# Глобальный словарь для хранения задач безопасности по ID котла.
-# Это предотвращает сборку мусора и позволяет отменять старые таймеры.
+# Глобальный словарь для хранения задач безопасности
 _safety_tasks = {}
 
 @parameters([
@@ -44,8 +43,8 @@ class HeatStep(CBPiStep):
         self.kettle_id = self.kettle.id if self.kettle else None
         
         if self.kettle is not None:
-            # Обновляем целевую температуру через API для синхронизации с UI/БД
-            await self._update_target_temp()
+            # Прямое присваивание уставки - самый надежный способ передать температуру в KettleLogic
+            self.kettle.target_temp = self.target_temp
             
             # Включаем нагрев
             await self.setAutoMode(True)
@@ -54,15 +53,18 @@ class HeatStep(CBPiStep):
             
             # Нативная защита через asyncio
             if self.safety_timeout_minutes > 0:
-                # 1. Отменяем предыдущую задачу безопасности для этого котла, если она была
+                # Отменяем предыдущую задачу, если она была
                 old_task = _safety_tasks.get(self.kettle_id)
                 if old_task:
                     old_task.cancel()
-                    logger.info(f"HeatStep: Cancelled previous safety task for kettle {self.kettle_id}")
 
-                # 2. Создаем новую задачу и сохраняем ссылку, чтобы избежать GC
+                # Создаем новую задачу
                 task = asyncio.create_task(self._safety_shutdown(self.safety_timeout_minutes * 60))
+                
+                # Добавляем callback для автоматической очистки словаря после завершения/отмены задачи
+                task.add_done_callback(lambda t: _safety_tasks.pop(self.kettle_id, None))
                 _safety_tasks[self.kettle_id] = task
+                
                 logger.info(f"HeatStep: Native safety task started, will shutdown in {self.safety_timeout_minutes} min")
         else:
             self.cbpi.notify(self.name, 'Error: No kettle selected!', NotificationType.ERROR)
@@ -75,8 +77,8 @@ class HeatStep(CBPiStep):
         try:
             await asyncio.sleep(seconds)
             
-            # Получаем актуальный объект котла из центрального реестра CBPi4 (безопаснее, чем self.kettle)
-            kettle = self.cbpi.kettle.get(self.kettle_id)
+            # Используем встроенный метод шага для получения актуального объекта котла
+            kettle = self.get_kettle(self.kettle_id)
             
             if kettle and kettle.instance and kettle.instance.state:
                 await kettle.instance.stop()
@@ -90,18 +92,6 @@ class HeatStep(CBPiStep):
         except Exception as e:
             logger.error(f"HeatStep: Safety task error for kettle {self.kettle_id}: {e}")
 
-    async def _update_target_temp(self):
-        """Обновляет целевую температуру через API для корректного отображения в UI/БД"""
-        try:
-            url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle_id}"
-            payload = {"target_temp": self.target_temp}
-            async with aiohttp.ClientSession() as session:
-                async with session.put(url, json=payload) as response:
-                    if response.status == 200:
-                        logger.info(f"HeatStep: Target temp updated to {self.target_temp}°C")
-        except Exception as e:
-            logger.error(f"HeatStep: Error updating target temp: {e}")
-
     async def on_stop(self):
         await self.timer.stop()
         self.summary = ""
@@ -109,9 +99,8 @@ class HeatStep(CBPiStep):
         # Отменяем задачу безопасности при ручной остановке шага
         if self.kettle_id and self.kettle_id in _safety_tasks:
             _safety_tasks[self.kettle_id].cancel()
-            del _safety_tasks[self.kettle_id]
-            logger.info(f"HeatStep: Safety task cancelled due to manual stop")
-        
+            # Callback сам удалит запись из словаря
+            
         # Выключаем AutoMode только при ручной остановке
         if self.kettle is not None and not self.step_completed_normally:
             await self.setAutoMode(False)
@@ -125,10 +114,8 @@ class HeatStep(CBPiStep):
         self.timer = Timer(1, on_update=self.on_timer_update, on_done=self.on_timer_done)
         self.step_completed_normally = False
         
-        # Также отменяем задачу при сбросе шага
         if self.kettle_id and self.kettle_id in _safety_tasks:
             _safety_tasks[self.kettle_id].cancel()
-            del _safety_tasks[self.kettle_id]
 
     async def run(self):
         while self.running == True:
@@ -140,14 +127,12 @@ class HeatStep(CBPiStep):
             if self.kettle is None:
                 return
             
-            # Включение через API (аналогично нажатию кнопки в интерфейсе)
             if (self.kettle.instance is None or self.kettle.instance.state == False) and (auto_state is True):
                 url = f"http://127.0.0.1:{self.port}/kettle/{self.kettle.id}/toggle"
                 async with aiohttp.ClientSession() as session:
                     async with session.post(url) as response:
                         return await response.text()
             
-            # Выключение через внутренний метод экземпляра (надежнее при активной сессии)
             elif self.kettle.instance is not None and self.kettle.instance.state == True and (auto_state is False):
                 await self.kettle.instance.stop()
                 await self.push_update()
