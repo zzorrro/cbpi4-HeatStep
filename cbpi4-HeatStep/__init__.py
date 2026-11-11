@@ -29,7 +29,7 @@ def _make_cleanup(kettle_id, task):
 @parameters([
     Property.Kettle(label="Kettle", description="Kettle to control"),
     Property.Number(label="Target Temp", description="Target temperature (°C)", configurable=True),
-    Property.Number(label="Safety Timeout", description="Auto shutoff after N minutes (default 60, 0 = disabled)", configurable=True)
+    Property.Number(label="Safety Timeout", description="Auto shutoff after N minutes (default 90, 0 = disabled)", configurable=True)
 ])
 class HeatStep(CBPiStep):
 
@@ -46,7 +46,7 @@ class HeatStep(CBPiStep):
         self.port = str(self.cbpi.static_config.get('port', 8000))
         self.step_completed_normally = False
         
-        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 60))
+        self.safety_timeout_minutes = int(self.props.get("Safety Timeout", 90))
         
         # Таймер на 1 секунду для мгновенного перехода к следующему шагу
         if self.timer is None:
